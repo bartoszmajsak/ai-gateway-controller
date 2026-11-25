@@ -1358,14 +1358,37 @@ func TestReconcileClaimDoesNotApplyRevokedForce(t *testing.T) {
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, leftover, newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(funcs).Build()
 
-	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
-	for pass := range 2 {
-		if _, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName)); err != nil {
-			t.Fatalf("pass %d: Reconcile: %v", pass, err)
-		}
-		if names, _, _ := rec.snapshot(); len(names) != 0 {
-			t.Fatalf("pass %d: applied %v with the force annotation revoked", pass, names)
-		}
+	eventRecorder := events.NewFakeRecorder(10)
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute, Recorder: eventRecorder}
+
+	// The claim pass: the retried claim wins, and the pass ends without applying.
+	if _, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName)); err != nil {
+		t.Fatalf("claim pass: Reconcile: %v", err)
+	}
+	if names, _, _ := rec.snapshot(); len(names) != 0 {
+		t.Fatalf("claim pass applied %v", names)
+	}
+	stored := NewMaasTenantConfig()
+	if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(mtc), stored); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if PayloadProcessingStatus(stored) != PayloadProcessingStatusSteady || forcePayloadProcessingMigration(stored) {
+		t.Fatalf("status = %q, force = %v; want steady with the force annotation revoked",
+			PayloadProcessingStatus(stored), forcePayloadProcessingMigration(stored))
+	}
+
+	// The next pass reads the revocation, and the gate refuses the leftover.
+	if _, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName)); err != nil {
+		t.Fatalf("apply pass: Reconcile: %v", err)
+	}
+	if names, _, _ := rec.snapshot(); len(names) != 0 {
+		t.Fatalf("apply pass applied %v with the force annotation revoked", names)
+	}
+	if len(eventRecorder.Events) != 1 {
+		t.Fatalf("events = %d, want the gate's refusal", len(eventRecorder.Events))
+	}
+	if event := <-eventRecorder.Events; !strings.Contains(event, reasonPluginsMigrationRefused) {
+		t.Fatalf("event = %q, want %s", event, reasonPluginsMigrationRefused)
 	}
 }
 

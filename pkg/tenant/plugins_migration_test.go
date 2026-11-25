@@ -96,25 +96,34 @@ func TestEnsurePluginsConfigMapMigrationAllowed(t *testing.T) {
 		}
 	})
 
-	// The pass read the force annotation at its start; an operator may have
-	// revoked it before the gate runs.
-	t.Run("ipp-shaped blocks when force was revoked since the pass started", func(t *testing.T) {
-		t.Parallel()
-		snapshot := mtc.DeepCopy()
-		snapshot.SetAnnotations(map[string]string{AnnotationForcePayloadProcessingMigration: "true"})
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: PayloadProcessingPluginsConfigMapName, Namespace: "openshift-ingress"},
-			Data: map[string]string{
-				ippProcessingConfigKey: "kind: PayloadProcessorConfig\n",
-			},
-		}
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm, mtc.DeepCopy()).Build()
-		r := &Reconciler{Client: c, APIReader: c}
-		err := r.ensurePluginsConfigMapMigrationAllowed(t.Context(), snapshot, "openshift-ingress", "")
-		if _, ok := errors.AsType[*pluginsMigrationRefusedError](err); !ok {
-			t.Fatalf("err = %v, want a refusal once the live object has no force annotation", err)
-		}
-	})
+	// The pass kept its apply set on the force annotation it read at its
+	// start. Whatever the released ConfigMap holds now, including data an
+	// operator edited away from IPP, a revocation since then must stop the
+	// pass before anything is applied.
+	for shape, data := range map[string]map[string]string{
+		"ipp-shaped":        {ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"},
+		"edited to non-IPP": {"extproc.yaml": "server: {}\n"},
+	} {
+		t.Run(shape+" stops the pass when force was revoked since it started", func(t *testing.T) {
+			t.Parallel()
+			snapshot := mtc.DeepCopy()
+			snapshot.SetAnnotations(map[string]string{AnnotationForcePayloadProcessingMigration: "true"})
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        PayloadProcessingPluginsConfigMapName,
+					Namespace:   "openshift-ingress",
+					Annotations: map[string]string{AnnotationManaged: "false"},
+				},
+				Data: data,
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm, mtc.DeepCopy()).Build()
+			r := &Reconciler{Client: c, APIReader: c}
+			err := r.ensurePluginsConfigMapMigrationAllowed(t.Context(), snapshot, "openshift-ingress", "")
+			if !errors.Is(err, errForceMigrationRevoked) {
+				t.Fatalf("err = %v, want %v", err, errForceMigrationRevoked)
+			}
+		})
+	}
 
 	// Cache lag: Client sees NotFound / Praxis-shaped; live still has IPP keys.
 	// The guard must use APIReader so ForceOwnership cannot overwrite IPP config.

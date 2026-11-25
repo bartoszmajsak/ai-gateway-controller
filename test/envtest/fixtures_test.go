@@ -157,8 +157,10 @@ func annotateTenantConfig(t *testing.T, c client.Client, namespace, key, value s
 }
 
 // awaitExtProcMaxRequests waits until every ExtProc upstream cluster patched
-// into the tenant's gateway EnvoyFilter uses want as its circuit-breaker
-// max_requests.
+// into the tenant's gateway EnvoyFilter (the CLUSTER patches named *-extproc)
+// carries exactly one circuit-breaker threshold with want as its max_requests.
+// A cluster without a circuit breaker fails the check rather than being
+// skipped, since it would run on Envoy's defaults.
 func awaitExtProcMaxRequests(t *testing.T, c client.Client, namespace string, want int64, timeout time.Duration) {
 	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
@@ -177,20 +179,23 @@ func awaitExtProcMaxRequests(t *testing.T, c client.Client, namespace string, wa
 			if patch["applyTo"] != "CLUSTER" {
 				continue
 			}
-			thresholds, found, nestedErr := unstructured.NestedSlice(patch, "patch", "value", "circuit_breakers", "thresholds")
+			name, _, nestedErr := unstructured.NestedString(patch, "patch", "value", "name")
 			require.NoError(collect, nestedErr)
-			if !found {
+			if !strings.HasSuffix(name, "-extproc") {
 				continue
 			}
-			require.Len(collect, thresholds, 1)
+			thresholds, found, nestedErr := unstructured.NestedSlice(patch, "patch", "value", "circuit_breakers", "thresholds")
+			require.NoError(collect, nestedErr)
+			require.True(collect, found, "ExtProc cluster %s has no circuit breaker", name)
+			require.Len(collect, thresholds, 1, "ExtProc cluster %s thresholds", name)
 			threshold, ok := thresholds[0].(map[string]any)
 			require.True(collect, ok, "threshold = %T, want a map", thresholds[0])
 			got, _, nestedErr := unstructured.NestedInt64(threshold, "max_requests")
 			require.NoError(collect, nestedErr)
-			require.Equal(collect, want, got)
+			require.Equal(collect, want, got, "ExtProc cluster %s max_requests", name)
 			clusters++
 		}
-		require.NotZero(collect, clusters, "no ExtProc cluster patch carries a circuit breaker")
+		require.NotZero(collect, clusters, "the tenant's EnvoyFilter patches no ExtProc cluster")
 	}, timeout, pollInterval, "the tenant's ExtProc clusters must use max_requests %d", want)
 }
 

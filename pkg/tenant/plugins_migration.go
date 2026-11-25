@@ -18,6 +18,7 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +42,10 @@ const (
 	reasonPluginsMigrationRefused = "PluginsMigrationRefused"
 	applyPraxisAction             = "ApplyPraxis"
 )
+
+// errForceMigrationRevoked is the force annotation the pass acted on having
+// been removed before the gate ran.
+var errForceMigrationRevoked = errors.New(AnnotationForcePayloadProcessingMigration + " was removed during this reconcile")
 
 // pluginsMigrationRefusedError is the gate refusing an overwrite, as opposed to
 // failing to read the live ConfigMap. It carries the version that refused, so
@@ -68,6 +73,23 @@ func (r *Reconciler) ensurePluginsConfigMapMigrationAllowed(
 	mtc *unstructured.Unstructured,
 	gatewayNamespace, tenantID string,
 ) error {
+	// The pass chose its apply set from the force annotation it read at its
+	// start: under force, a released IPP plugins ConfigMap is kept for
+	// overwrite (omitUnmanagedReleasedPluginConfigMaps). The overwrite cannot
+	// be undone, so confirm the operator has not revoked force since, whatever
+	// the ConfigMap holds now. A revocation fails the pass; its retry, or the
+	// annotation update, recomputes the apply set from the current object.
+	if forcePayloadProcessingMigration(mtc) {
+		live := NewMaasTenantConfig()
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(mtc), live); err != nil {
+			return fmt.Errorf("re-read MaasTenantConfig %s for %s: %w", client.ObjectKeyFromObject(mtc), AnnotationForcePayloadProcessingMigration, err)
+		}
+		if !forcePayloadProcessingMigration(live) {
+			return fmt.Errorf("MaasTenantConfig %s: %w", client.ObjectKeyFromObject(mtc), errForceMigrationRevoked)
+		}
+		return nil
+	}
+
 	cm := &corev1.ConfigMap{}
 	key := client.ObjectKey{
 		Namespace: gatewayNamespace,
@@ -86,18 +108,6 @@ func (r *Reconciler) ensurePluginsConfigMapMigrationAllowed(
 	}
 	if !isIPPPluginsConfigMapData(cm.Data) {
 		return nil
-	}
-	// The force annotation was read when the pass started, and the overwrite
-	// it allows cannot be undone, so confirm the operator has not revoked it
-	// since.
-	if forcePayloadProcessingMigration(mtc) {
-		live := NewMaasTenantConfig()
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(mtc), live); err != nil {
-			return fmt.Errorf("re-read MaasTenantConfig %s for %s: %w", client.ObjectKeyFromObject(mtc), AnnotationForcePayloadProcessingMigration, err)
-		}
-		if forcePayloadProcessingMigration(live) {
-			return nil
-		}
 	}
 	return &pluginsMigrationRefusedError{key: key, resourceVersion: cm.ResourceVersion}
 }
