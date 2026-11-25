@@ -18,6 +18,7 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +34,7 @@ func TestEnsurePluginsConfigMapMigrationAllowed(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	scheme.AddKnownTypeWithName(MaasTenantConfigGVK, &unstructured.Unstructured{})
 
 	mtc := &unstructured.Unstructured{}
 	mtc.SetGroupVersionKind(MaasTenantConfigGVK)
@@ -87,10 +89,30 @@ func TestEnsurePluginsConfigMapMigrationAllowed(t *testing.T) {
 				ippProcessingConfigKey: "kind: PayloadProcessorConfig\n",
 			},
 		}
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).Build()
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm, forced).Build()
 		r := &Reconciler{Client: c, APIReader: c}
 		if err := r.ensurePluginsConfigMapMigrationAllowed(context.Background(), forced, "openshift-ingress", ""); err != nil {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	// The pass read the force annotation at its start; an operator may have
+	// revoked it before the gate runs.
+	t.Run("ipp-shaped blocks when force was revoked since the pass started", func(t *testing.T) {
+		t.Parallel()
+		snapshot := mtc.DeepCopy()
+		snapshot.SetAnnotations(map[string]string{AnnotationForcePayloadProcessingMigration: "true"})
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: PayloadProcessingPluginsConfigMapName, Namespace: "openshift-ingress"},
+			Data: map[string]string{
+				ippProcessingConfigKey: "kind: PayloadProcessorConfig\n",
+			},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm, mtc.DeepCopy()).Build()
+		r := &Reconciler{Client: c, APIReader: c}
+		err := r.ensurePluginsConfigMapMigrationAllowed(t.Context(), snapshot, "openshift-ingress", "")
+		if _, ok := errors.AsType[*pluginsMigrationRefusedError](err); !ok {
+			t.Fatalf("err = %v, want a refusal once the live object has no force annotation", err)
 		}
 	})
 

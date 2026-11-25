@@ -98,6 +98,33 @@ func withProviderModel(provider, targetModel string) externalModelOption {
 
 func awaitPraxisInstalled(t *testing.T, c client.Client, namespace string) {
 	t.Helper()
+	awaitPraxisInstalledWithin(t, c, namespace, eventuallyTimeout)
+}
+
+// praxisInstalled reports whether the tenant's Praxis Deployment exists. It
+// returns the read error instead of failing the test, so it is safe in
+// conditions testify evaluates off the test goroutine.
+func praxisInstalled(ctx context.Context, c client.Client, namespace string) (bool, error) {
+	err := c.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: "payload-processing-" + namespace}, &appsv1.Deployment{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// awaitTenantConfigState waits until the tenant's MaasTenantConfig satisfies
+// check, which reports what it is still missing.
+func awaitTenantConfigState(t *testing.T, c client.Client, namespace, description string, check func(*unstructured.Unstructured) bool) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		mtc := tenant.NewMaasTenantConfig()
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc))
+		require.True(collect, check(mtc), description)
+	}, eventuallyTimeout, pollInterval, description)
+}
+
+func awaitPraxisInstalledWithin(t *testing.T, c client.Client, namespace string, timeout time.Duration) {
+	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		var deployment appsv1.Deployment
 		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{Namespace: gatewayNamespace, Name: "payload-processing-" + namespace}, &deployment))
@@ -106,7 +133,65 @@ func awaitPraxisInstalled(t *testing.T, c client.Client, namespace string) {
 		var binding rbacv1.ClusterRoleBinding
 		err := c.Get(t.Context(), client.ObjectKey{Name: "payload-processing-reader-" + namespace}, &binding)
 		require.True(collect, apierrors.IsNotFound(err), "reader ClusterRoleBinding must not be installed")
-	}, eventuallyTimeout, pollInterval, "the existing tenant must have its Praxis installation")
+	}, timeout, pollInterval, "the existing tenant must have its Praxis installation")
+}
+
+// annotateTenantConfig sets an annotation on the tenant's MaasTenantConfig, or
+// removes it when value is empty, as an operator would with kubectl annotate.
+func annotateTenantConfig(t *testing.T, c client.Client, namespace, key, value string) {
+	t.Helper()
+	mtc := tenant.NewMaasTenantConfig()
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc))
+	base := mtc.DeepCopy()
+	annotations := mtc.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	if value == "" {
+		delete(annotations, key)
+	} else {
+		annotations[key] = value
+	}
+	mtc.SetAnnotations(annotations)
+	require.NoError(t, c.Patch(t.Context(), mtc, client.MergeFrom(base)))
+}
+
+// awaitExtProcMaxRequests waits until every ExtProc upstream cluster patched
+// into the tenant's gateway EnvoyFilter uses want as its circuit-breaker
+// max_requests.
+func awaitExtProcMaxRequests(t *testing.T, c client.Client, namespace string, want int64, timeout time.Duration) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		filter := &unstructured.Unstructured{}
+		filter.SetAPIVersion("networking.istio.io/v1alpha3")
+		filter.SetKind("EnvoyFilter")
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: gatewayNamespace, Name: tenant.PayloadProcessingEnvoyFilterName(namespace),
+		}, filter))
+		patches, _, err := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+		require.NoError(collect, err)
+		clusters := 0
+		for _, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			require.True(collect, ok, "config patch = %T, want a map", raw)
+			if patch["applyTo"] != "CLUSTER" {
+				continue
+			}
+			thresholds, found, nestedErr := unstructured.NestedSlice(patch, "patch", "value", "circuit_breakers", "thresholds")
+			require.NoError(collect, nestedErr)
+			if !found {
+				continue
+			}
+			require.Len(collect, thresholds, 1)
+			threshold, ok := thresholds[0].(map[string]any)
+			require.True(collect, ok, "threshold = %T, want a map", thresholds[0])
+			got, _, nestedErr := unstructured.NestedInt64(threshold, "max_requests")
+			require.NoError(collect, nestedErr)
+			require.Equal(collect, want, got)
+			clusters++
+		}
+		require.NotZero(collect, clusters, "no ExtProc cluster patch carries a circuit breaker")
+	}, timeout, pollInterval, "the tenant's ExtProc clusters must use max_requests %d", want)
 }
 
 // awaitModelPublished returns the name of the HTTPRoute published for model.

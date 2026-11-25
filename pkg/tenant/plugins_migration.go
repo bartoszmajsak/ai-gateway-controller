@@ -35,7 +35,27 @@ const (
 
 	ippPreProcessingConfigKey = "custom-pre-processing-ipp-config.yaml"
 	ippProcessingConfigKey    = "custom-ipp-config.yaml"
+
+	// reasonPluginsMigrationRefused is the Warning event reason on a
+	// MaasTenantConfig whose Praxis apply the migration gate refuses.
+	reasonPluginsMigrationRefused = "PluginsMigrationRefused"
+	applyPraxisAction             = "ApplyPraxis"
 )
+
+// pluginsMigrationRefusedError is the gate refusing an overwrite, as opposed to
+// failing to read the live ConfigMap. It carries the version that refused, so
+// the caller can tell whether the informer has seen it.
+type pluginsMigrationRefusedError struct {
+	key             client.ObjectKey
+	resourceVersion string
+}
+
+func (e *pluginsMigrationRefusedError) Error() string {
+	return fmt.Sprintf(
+		"live IPP-shaped plugins ConfigMap %s still present; refusing Praxis overwrite without %s=true (maas-controller should gate/cleanup first)",
+		e.key, AnnotationForcePayloadProcessingMigration,
+	)
+}
 
 // ensurePluginsConfigMapMigrationAllowed is defense-in-depth for RHOAIENG-98846.
 // maas-controller owns the primary gate (fingerprint known-good baselines before
@@ -48,10 +68,6 @@ func (r *Reconciler) ensurePluginsConfigMapMigrationAllowed(
 	mtc *unstructured.Unstructured,
 	gatewayNamespace, tenantID string,
 ) error {
-	if forcePayloadProcessingMigration(mtc) {
-		return nil
-	}
-
 	cm := &corev1.ConfigMap{}
 	key := client.ObjectKey{
 		Namespace: gatewayNamespace,
@@ -71,10 +87,19 @@ func (r *Reconciler) ensurePluginsConfigMapMigrationAllowed(
 	if !isIPPPluginsConfigMapData(cm.Data) {
 		return nil
 	}
-	return fmt.Errorf(
-		"live IPP-shaped plugins ConfigMap %s/%s still present; refusing Praxis overwrite without %s=true (maas-controller should gate/cleanup first)",
-		cm.Namespace, cm.Name, AnnotationForcePayloadProcessingMigration,
-	)
+	// The force annotation was read when the pass started, and the overwrite
+	// it allows cannot be undone, so confirm the operator has not revoked it
+	// since.
+	if forcePayloadProcessingMigration(mtc) {
+		live := NewMaasTenantConfig()
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(mtc), live); err != nil {
+			return fmt.Errorf("re-read MaasTenantConfig %s for %s: %w", client.ObjectKeyFromObject(mtc), AnnotationForcePayloadProcessingMigration, err)
+		}
+		if forcePayloadProcessingMigration(live) {
+			return nil
+		}
+	}
+	return &pluginsMigrationRefusedError{key: key, resourceVersion: cm.ResourceVersion}
 }
 
 func forcePayloadProcessingMigration(mtc *unstructured.Unstructured) bool {
